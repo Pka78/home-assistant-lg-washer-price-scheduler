@@ -1,0 +1,157 @@
+# Home Assistant package: LG ThinQ washer price scheduler
+# Replace generic washer and Nord Pool entity IDs before installing.
+# Program selection and Remote Start remain manual on the washer.
+
+input_datetime:
+  washer_ready_by:
+    name: Washer ready by
+    has_date: true
+    has_time: true
+
+input_button:
+  washer_find_cheapest_window:
+    name: Find cheapest wash window
+    icon: mdi:cash-clock
+
+input_number:
+  washer_price_adders:
+    name: Washer price adders
+    min: 0
+    max: 50
+    step: 0.01
+    initial: 0
+    unit_of_measurement: "¢/kWh"
+    mode: box
+
+automation:
+  - id: lg_washer_find_cheapest_finish
+    alias: LG washer · find cheapest finish window
+    description: >-
+      Compares hourly LG delayed-finish choices against Nord Pool prices and
+      sets the cheapest valid schedule. It never starts the washer.
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: input_button.washer_find_cheapest_window
+    conditions: []
+    actions:
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ not is_state('binary_sensor.washer_remote_start', 'on')
+                     or not is_state('sensor.washer_current_status', 'initial')
+                     or not is_number(states('sensor.washer_total_time'))
+                     or states('sensor.washer_total_time')|float(0) <= 0
+                     or as_timestamp(states('input_datetime.washer_ready_by'), none) is none
+                     or as_timestamp(states('input_datetime.washer_ready_by'), none) <= as_timestamp(now()) }}
+            sequence:
+              - action: persistent_notification.create
+                data:
+                  notification_id: lg_washer_price_scheduler
+                  title: Washer schedule not changed
+                  message: >-
+                    Select a program on the washer, enable Remote Start, make
+                    sure its status is initial, and set a future finish deadline.
+                    The current schedule was not changed.
+        default:
+          - variables:
+              plan_json: >-
+                {% set deadline = as_timestamp(states('input_datetime.washer_ready_by'), none) %}
+                {% set duration = states('sensor.washer_total_time')|float(0) * 60 %}
+                {% set now_ts = as_timestamp(now()) %}
+                {% set rows = (state_attr('sensor.nordpool_price', 'raw_today') or []) + (state_attr('sensor.nordpool_price', 'raw_tomorrow') or []) %}
+                {% set surcharge_eur = states('input_number.washer_price_adders')|float(0) / 100 %}
+                {% set best = namespace(delay=-1, start=0, finish=0, price=none) %}
+                {% if deadline is not none and deadline > now_ts and duration > 0 %}
+                  {% for delay in range(1, 20) %}
+                    {% set finish = now_ts + delay * 3600 %}
+                    {% set start = finish - duration %}
+                    {% if start >= now_ts and finish <= deadline %}
+                      {% set cost = namespace(weighted=0, covered=0) %}
+                      {% for slot in rows %}
+                        {% set slot_start = as_timestamp(slot.start, none) %}
+                        {% set slot_end = as_timestamp(slot.end, none) %}
+                        {% if slot_start is not none and slot_end is not none and slot_end > slot_start and is_number(slot.value) %}
+                          {% set overlap = [0, ([finish, slot_end]|min - [start, slot_start]|max)]|max %}
+                          {% if overlap > 0 %}
+                            {% set cost.weighted = cost.weighted + overlap * (slot.value|float) %}
+                            {% set cost.covered = cost.covered + overlap %}
+                          {% endif %}
+                        {% endif %}
+                      {% endfor %}
+                      {% if cost.covered >= duration - 1 %}
+                        {% set average = cost.weighted / cost.covered + surcharge_eur %}
+                        {% if best.price is none or average < best.price %}
+                          {% set best.delay = delay %}
+                          {% set best.start = start %}
+                          {% set best.finish = finish %}
+                          {% set best.price = average %}
+                        {% endif %}
+                      {% endif %}
+                    {% endif %}
+                  {% endfor %}
+                {% endif %}
+                {{ best.delay|int }}|{{ best.start|int }}|{{ best.finish|int }}|{{ best.price|float(0) }}
+          - variables:
+              plan_delay: "{{ plan_json.split('|')[0]|int(-1) }}"
+              plan_finish: "{{ plan_json.split('|')[2]|int(0) }}"
+              plan_price: "{{ plan_json.split('|')[3]|float(0) }}"
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ plan_delay|int(-1) < 1 }}"
+                sequence:
+                  - action: persistent_notification.create
+                    data:
+                      notification_id: lg_washer_price_scheduler
+                      title: Washer schedule not changed
+                      message: >-
+                        No complete, valid price window was found before the
+                        deadline. Check the deadline and Nord Pool price data.
+                        The current schedule was not changed.
+            default:
+              - action: number.set_value
+                target:
+                  entity_id: number.washer_delayed_end
+                data:
+                  value: "{{ plan_delay|int }}"
+                continue_on_error: true
+              - wait_template: >-
+                  {% set actual_finish = as_timestamp(states('sensor.washer_delayed_end'), none) %}
+                  {{ is_state('sensor.washer_current_status', 'reserved')
+                     and actual_finish is not none
+                     and (actual_finish - plan_finish|float)|abs < 300
+                     and states('number.washer_delayed_end')|int(-1) == plan_delay|int }}
+                timeout: "00:01:30"
+                continue_on_timeout: true
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: >-
+                          {% set actual_finish = as_timestamp(states('sensor.washer_delayed_end'), none) %}
+                          {{ is_state('sensor.washer_current_status', 'reserved')
+                             and actual_finish is not none
+                             and (actual_finish - plan_finish|float)|abs < 300
+                             and states('number.washer_delayed_end')|int(-1) == plan_delay|int }}
+                    sequence:
+                      - action: persistent_notification.create
+                        data:
+                          notification_id: lg_washer_price_scheduler
+                          title: Washer schedule confirmed
+                          message: >-
+                            LG acknowledged the delayed-finish schedule for
+                            {{ plan_finish|int|timestamp_custom('%d.%m. %H:%M', true) }}.
+                            Estimated average price: {{ (plan_price|float * 100)|round(2) }} ¢/kWh.
+                            Energy use is assumed to be evenly spread across the
+                            reported cycle duration.
+                default:
+                  - action: persistent_notification.create
+                    data:
+                      notification_id: lg_washer_price_scheduler
+                      title: Washer did not confirm the new schedule
+                      message: >-
+                        Home Assistant sent the delayed-finish value, but LG did
+                        not confirm the expected timestamp and reserved state.
+                        Check the washer; the previous schedule may still be active.
+                        No automatic retry was made.
